@@ -120,6 +120,10 @@ class AerospikeConfig(
     ignore_empty_sets: bool = Field(
         default=False, description="Ignore empty sets in the schema inference."
     )
+    records_per_second: Optional[int] = Field(
+        default=None,
+        description="Number of records per second for Aerospike query. Default is None, which means no limit.",
+    )
     # Custom Stateful Ingestion settings
     stateful_ingestion: Optional[StatefulStaleMetadataRemovalConfig] = None
 
@@ -193,59 +197,6 @@ class AerospikeSet:
             setattr(self, key, value)
 
 
-def construct_schema_aeropsike(
-    set: AerospikeSet,
-    delimiter: str,
-    max_document_size: int,
-    should_add_document_size_filter: bool,
-    sample_size: Optional[int] = None,
-) -> Dict[Tuple[str, ...], SchemaDescription]:
-    """
-    Calls construct_schema on a PyMongo collection.
-
-    Returned schema is keyed by tuples of nested field names, with each
-    value containing 'types', 'count', 'nullable', 'delimited_name', and 'type' attributes.
-
-    Parameters
-    ----------
-        set:
-            the Aerospike collection
-        delimiter:
-            string to concatenate field names by
-        max_document_size:
-            maximum size of the document that will be considered for generating the schema.
-        should_add_document_size_filter:
-            boolean to indicate if document size filter should be added to aggregation
-        sample_size:
-            number of items in the collection to sample
-            (reads entire collection if not provided)
-    """
-
-    aggregations: List[Dict] = []
-    if should_add_document_size_filter:
-        doc_size_field = "temporary_doc_size_field"
-        # create a temporary field to store the size of the document. filter on it and then remove it.
-        aggregations = [
-            {"$addFields": {doc_size_field: {"$bsonSize": "$$ROOT"}}},
-            {"$match": {doc_size_field: {"$lt": max_document_size}}},
-            {"$project": {doc_size_field: 0}},
-        ]
-    if use_random_sampling:
-        # get sample documents in collection
-        if sample_size:
-            aggregations.append({"$sample": {"size": sample_size}})
-        documents = collection.aggregate(
-            aggregations,
-            allowDiskUse=True,
-        )
-    else:
-        if sample_size:
-            aggregations.append({"$limit": sample_size})
-        documents = collection.aggregate(aggregations, allowDiskUse=True)
-
-    return construct_schema(list(documents), delimiter)
-
-
 @platform_name("MongoDB")
 @config_class(AerospikeConfig)
 @support_status(SupportStatus.CERTIFIED)
@@ -307,6 +258,69 @@ class AerospikeSource(StatefulIngestionSourceBase):
                 self, self.config, self.ctx
             ).workunit_processor,
         ]
+
+    def construct_schema_aeropsike(
+            self,
+            as_set: AerospikeSet,
+            delimiter: str,
+            max_document_size: int,
+            should_add_document_size_filter: bool,
+            sample_size: Optional[int] = None,
+    ) -> Dict[Tuple[str, ...], SchemaDescription]:
+        """
+        Calls construct_schema on a PyMongo collection.
+
+        Returned schema is keyed by tuples of nested field names, with each
+        value containing 'types', 'count', 'nullable', 'delimited_name', and 'type' attributes.
+
+        Parameters
+        ----------
+            as_set:
+                the Aerospike collection
+            delimiter:
+                string to concatenate field names by
+            max_document_size:
+                maximum size of the document that will be considered for generating the schema.
+            should_add_document_size_filter:
+                boolean to indicate if document size filter should be added to aggregation
+            sample_size:
+                number of items in the collection to sample
+                (reads entire collection if not provided)
+        """
+
+        query = self.aerospike_client.query(as_set.ns, as_set.set)
+        if sample_size:
+            query.max_records = sample_size
+        query.records_per_second = 10
+        res = query.results()
+        records = [record[2] for record in res]
+        delimiter = "."
+        construct_schema(records, delimiter)
+
+        aggregations: List[Dict] = []
+        if should_add_document_size_filter:
+            doc_size_field = "temporary_doc_size_field"
+            # create a temporary field to store the size of the document. filter on it and then remove it.
+            aggregations = [
+                {"$addFields": {doc_size_field: {"$bsonSize": "$$ROOT"}}},
+                {"$match": {doc_size_field: {"$lt": max_document_size}}},
+                {"$project": {doc_size_field: 0}},
+            ]
+        if use_random_sampling:
+            # get sample documents in collection
+            if sample_size:
+                aggregations.append({"$sample": {"size": sample_size}})
+            documents = collection.aggregate(
+                aggregations,
+                allowDiskUse=True,
+            )
+        else:
+            if sample_size:
+                aggregations.append({"$limit": sample_size})
+            documents = collection.aggregate(aggregations, allowDiskUse=True)
+
+        return construct_schema(list(documents), delimiter)
+
 
     def get_field_type(
         self, field_type: Union[Type, str], set_name: str
